@@ -1,0 +1,336 @@
+type 'a	t = {
+    name: string;
+    data: 'a;
+    children: 'a t list
+} [@@deriving yojson]
+
+type position = Before of string | After of string | Lexical | End | Default
+
+exception Empty_path
+exception Duplicate_child
+exception Nonexistent_path
+exception Insert_error of string
+
+let make data name = { name = name; data = data; children = [] }
+
+let make_full data name children = { name = name; data = data; children = children }
+
+let name_of_node node = node.name
+let data_of_node node = node.data
+let children_of_node node = node.children
+
+let insert_immediate ?(position=Default) node name data children =
+    (* alert exn Vylist.insert_before; Vylist.insert_after:
+        [Not_found] allow raise
+     *)
+    let new_node = make_full data name children in
+    let children' =
+        match position with
+        | Default -> new_node :: node.children
+        | End -> node.children @ [new_node]
+        | Before s ->
+            (* allow raise of Not_found *)
+            (Vylist.insert_before[@alert "-exn"]) (fun x -> x.name = s) new_node node.children
+        | After s ->
+            (* allow raise of Not_found *)
+            (Vylist.insert_after[@alert "-exn"]) (fun x -> x.name = s) new_node node.children
+        | Lexical ->
+            Vylist.insert_compare (fun x y -> Util.lexical_numeric_compare x.name y.name) new_node node.children
+    in { node with children = children' }
+
+let delete_immediate node name =
+    let children' = Vylist.remove (fun x -> x.name = name) node.children in
+    { node with children = children' }
+
+let adopt node child =
+    { node with children = child :: node.children }
+
+let replace node child =
+    (* alert exn Vylist.replace:
+        [Not_found] allow raise
+     *)
+    let children = node.children in
+    let name = child.name in
+    let children' =
+        (* allow raise of Not_found *)
+        (Vylist.replace[@alert "-exn"]) (fun x -> x.name = name) child children
+    in
+    { node with children = children' }
+
+let replace_full node child name =
+    (* alert exn Vylist.replace:
+        [Not_found] allow raise
+     *)
+    let children = node.children in
+    let children' =
+        (* allow raise of Not_found *)
+        (Vylist.replace[@alert "-exn"]) (fun x -> x.name = name) child children
+    in
+    { node with children = children' }
+
+let find node name =
+    Vylist.find (fun x -> x.name = name) node.children
+
+let find_or_fail node name =
+    (* raises
+        [Nonexistent_path]
+     *)
+    let child = find node name in
+    match child with
+    | None -> raise Nonexistent_path
+    | Some child' -> child'
+
+let list_children node =
+    List.map (fun x -> x.name) node.children
+
+let rec do_with_child fn node path =
+    (* raises
+        [Nonexistent_path] from find_or_fail
+        [Empty_path]
+     *)
+    match path with
+    | [] -> raise Empty_path
+    | [name] -> fn node name
+    | name :: names ->
+        let next_child = find_or_fail node name in
+        let new_node = do_with_child fn next_child names in
+        replace node new_node
+
+let rec insert ?(position=Default) ?(children=[]) node path data =
+    (* raises
+        [Not_found] from insert_immediate
+        [Empty_path]
+        [Duplicate_child]
+        [Insert_error]
+     *)
+    match path with
+    | [] -> raise Empty_path
+    | [name] ->
+       (let last_child = find node name in
+        match last_child with
+        | None -> insert_immediate ~position:position node name data children
+        | (Some _) -> raise Duplicate_child)
+    | name :: names ->
+        let next_child = find node name in
+        match next_child with
+        | Some next_child' ->
+            let new_node = insert ~position:position ~children:children next_child' names data in
+            replace node new_node
+        | None ->
+            let s = Printf.sprintf "Non-existent intermediary node: \'%s\'" name in
+            raise (Insert_error s)
+
+let insert_maybe ?(position=Default) node path data =
+    (* raises
+        [Empty_path],
+        [Not_found],
+        [Insert_error] from insert
+     *)
+    try insert ~position:position node path data
+    with Duplicate_child -> node
+
+let sorted_children_of_node cmp node =
+    (* raises no exn, as find_or_fail cannot fail
+     *)
+    let names = list_children node in
+    let names = List.sort cmp names in
+    List.map (find_or_fail node) names
+
+let sort_children cmp node =
+    {node with children = (sorted_children_of_node cmp node)}
+
+(** Given a node N check if it has children with duplicate names,
+    and merge subsequent children's children into the first child by
+    that name.
+
+    While all insert functions maintain the "every child has unique name"
+    invariant, for nodes constructed manually with make/make_full and adopt
+    it may not hold, and constructing nodes this way is a sensible approach
+    for config parsing. Depending on the config format, duplicate node names
+    may be normal and even expected, such as "ethernet eth0" and "ethernet eth1"
+    in the "curly" format.
+ *)
+let merge_children merge_data cmp node =
+    (* Given a node N and a list of nodes NS, find all nodes in NS that
+       have the same name as N and merge their children into N, sorting
+       children by a comparison function cmp (string -> string -> int) on
+       node names *)
+    let rec merge_into n ns =
+        match ns with
+        | [] -> n
+        | n' :: ns' ->
+            if n.name = n'.name then
+                let children = List.append n.children n'.children in
+                let data = merge_data n.data n'.data in
+                let n = {n with children=children; data=data} in
+                let n = sort_children cmp n in
+                merge_into n ns'
+            else merge_into n ns'
+    in
+    (* Given a list of nodes, for every node, find subsequent children with
+       the same name and merge them into the first node, then delete remaining
+       nodes from the list *)
+    let rec aux ns =
+        match ns with
+        | [] -> []
+        | n :: ns ->
+            let n = merge_into n ns in
+            let ns = List.filter (fun x -> x.name <> n.name) ns in
+            n :: (aux ns)
+    in {node with children=(aux node.children)}
+
+(* When inserting at a path that, entirely or partially,
+   does not exist yet, create missing nodes on the way with default data *)
+let rec insert_multi_level ?(position=Default) default_data node path_done path_remaining data =
+    match path_remaining with
+    | [] | [_] -> insert node (path_done @ path_remaining) data
+    | name :: names ->
+        let path_done = path_done @ [name] in
+        let node = insert ~position:position node path_done default_data in
+        insert_multi_level ~position:position default_data node path_done names data
+
+let delete node path =
+    do_with_child delete_immediate node path
+
+let rename node path newname =
+    (* raises
+        [Not_found] from replace_full
+        [Nonexistent_child] from find_or_fail; do_with_child
+        [Empty_path]
+     *)
+    if Util.is_empty path then raise Empty_path
+    else
+    let rename_immediate newname' node' name' =
+        let child = find_or_fail node' name' in
+        let child = { child with name=newname' } in
+        replace_full node' child name'
+    in do_with_child (rename_immediate newname) node path
+
+let update node path data =
+    let update_data data' node' name =
+        let child = find_or_fail node' name in
+        let child = { child with data=data' } in
+        replace node' child
+    in do_with_child (update_data data) node path
+
+let insert_or_update ?(position=Default) node path data =
+    try insert ~position:position node path data
+    with Duplicate_child -> update node path data
+
+let rec get node path =
+    (* raises
+        [Empty_path],
+        [Nonexistent_path] from find_or_fail
+     *)
+    match path with
+    | [] -> raise Empty_path
+    | [name] -> find_or_fail node name
+    | name :: names -> get (find_or_fail node name) names
+
+let get_data node path =
+    (* raises
+        [Empty_path],
+        [Nonexistent_path] from get
+     *)
+    data_of_node @@ get node path
+
+let exists node path =
+    (* raises
+        [Empty_path] from get
+     *)
+    try ignore (get node path); true
+    with Nonexistent_path -> false
+
+let get_existent_path node path =
+    let rec aux node path acc =
+        match path with
+        | [] -> acc
+        | name :: names ->
+            let child = find node name in
+            match child with
+            | None -> acc
+            | Some c -> aux c names (name :: acc)
+    in List.rev (aux node path [])
+
+let children_of_path node path =
+    (* raises
+        [Empty_path],
+        [Nonexistent_path] from get
+     *)
+    let node' = get node path in
+    list_children node'
+
+let copy node old_path new_path =
+    (* raises
+        [Empty_path] from exists
+        [Nonexistent_path] from get
+        [Insert_error] from insert
+     *)
+    if exists node new_path then raise Duplicate_child else
+    let child = get node old_path in
+    insert ~position:End ~children:child.children node new_path child.data
+
+let move node path position =
+    (* raises
+        [Empty_path],
+        [Nonexistent_path] from get; delete
+        [Not_found],
+        [Insert_error] from insert
+     *)
+    let child = get node path in
+    let node = delete node path in
+    insert ~position:position ~children:child.children node path child.data
+
+let is_terminal_node node =
+    match (children_of_node node) with
+    | [] -> true
+    | _ -> false
+
+let is_terminal_path node path =
+    (* raises
+        [Empty_path] from get
+     *)
+    try
+        let n = get node path in
+        is_terminal_node n
+    with Nonexistent_path -> false
+
+let fold_tree_with_path f (p', a) t =
+    let rec fold_func f (p', a) t =
+    let p =
+        match name_of_node t with
+        | "" -> p'
+        | name -> name :: p'
+    in
+    let children = children_of_node t in
+    match children with
+    | [] -> (Util.drop_first p), snd (f (p, a) t)
+    | c -> let res =
+        List.fold_left (fold_func f) (f (p, a) t) c in
+        (Util.drop_first p), snd res
+    in snd (fold_func f (p', a) t)
+
+(** Allow function called in fold to maintain a list of values for each
+    depth level of tree. A simple example is for the the function to cons a
+    boolean value to the list v at each call of the depth-first traversal;
+    at the return to local root, the value for that level is restored.
+    Note that if the function returns the empty list, this function reduces
+    to fold_tree_with_path.
+ *)
+
+let fold_tree_with_path_and_stack f ((p', v), a) t =
+    let rec fold_func f ((p', v), a) t =
+    let p =
+        match name_of_node t with
+        | "" -> p'
+        | name -> name :: p'
+    in
+    let children = children_of_node t in
+    match children with
+    | [] -> let res =
+        f ((p, v), a) t in
+        (Util.drop_first p, Util.drop_first (snd (fst res))), snd res
+    | c -> let res =
+        List.fold_left (fold_func f) (f ((p, v), a) t) c in
+        (Util.drop_first p, Util.drop_first (snd (fst res))), snd res
+    in snd (fold_func f ((p', v), a) t)
