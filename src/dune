@@ -1,0 +1,13 @@
+(ocamllex dozenos1x_lexer)
+(menhir
+ (flags --table)
+ (modules dozenos1x_parser))
+
+(library
+ (name dozenos1x)
+ (public_name dozenos1x-config)
+ (libraries yojson menhirLib fileutils pcre2 xml-light unix containers)
+ (preprocess (pps ppx_deriving_yojson))
+ (foreign_stubs
+  (language c)
+  (names lexical_numeric_compare)))
